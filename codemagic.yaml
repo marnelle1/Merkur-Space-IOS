@@ -70,20 +70,32 @@ workflows:
           cd "$IOS_DIR"
           agvtool new-version -all $((LATEST + 1))
 
-      # <<< Новый шаг — фикс для Xcode 16 традиционных headermap-ов >>>
-      - name: Fix Xcode 16 headermaps (OneSignal NSE & others)
+      # Fix traditional headermap usage for Xcode 15/16 (project + all targets, incl. OneSignal NSE)
+      - name: Fix headermaps via xcodeproj (project + all targets)
         script: |
           cd "$IOS_DIR"
-          PBX="Unity-iPhone.xcodeproj/project.pbxproj"
-          # Отключаем устаревший режим поиска пользовательских путей
-          /usr/bin/perl -0777 -pe 's/\bALWAYS_SEARCH_USER_PATHS = YES;/ALWAYS_SEARCH_USER_PATHS = NO;/g' -i "$PBX"
-          # Гарантируем, что header map включён
-          /usr/bin/perl -0777 -pe 's/\bUSE_HEADERMAP = NO;/USE_HEADERMAP = YES;/g' -i "$PBX" || true
+          ruby -e "begin; require 'xcodeproj'; rescue LoadError; system('gem install xcodeproj --no-document') || exit(1); end"
+          ruby - <<'RUBY'
+          require 'xcodeproj'
+          proj = Xcodeproj::Project.open('Unity-iPhone.xcodeproj')
+          proj.build_configurations.each do |cfg|
+            cfg.build_settings['ALWAYS_SEARCH_USER_PATHS'] = 'NO'
+            cfg.build_settings['USE_HEADERMAP'] = 'YES'
+          end
+          proj.targets.each do |t|
+            t.build_configurations.each do |cfg|
+              cfg.build_settings['ALWAYS_SEARCH_USER_PATHS'] = 'NO'
+              cfg.build_settings['USE_HEADERMAP'] = 'YES'
+            end
+          end
+          proj.save
+          RUBY
 
-      - name: Verify build settings
+      - name: Verify headermap settings (NSE target)
         script: |
           cd "$IOS_DIR"
-          xcodebuild -workspace "$XCODE_WORKSPACE" -scheme "$XCODE_SCHEME" -showBuildSettings | \
+          echo ">>> NSE build settings:"
+          xcodebuild -project "$XCODE_PROJECT" -target "OneSignalNotificationServiceExtension" -showBuildSettings | \
             /usr/bin/grep -E 'ALWAYS_SEARCH_USER_PATHS|USE_HEADERMAP' || true
 
       - name: Build ipa
