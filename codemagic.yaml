@@ -50,6 +50,7 @@ workflows:
             exit 1
           fi
 
+      # Добавляем App Group в главный таргет (подстраховка)
       - name: Ensure App Group entitlement (main app)
         script: |
           cd "$IOS_DIR"
@@ -58,20 +59,41 @@ workflows:
           /usr/libexec/PlistBuddy -c "Add :com.apple.security.application-groups array" "$ENT" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Delete :com.apple.security.application-groups:0" "$ENT" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :com.apple.security.application-groups:0 string $APP_GROUP" "$ENT"
-          /usr/libexec/PlistBuddy -c "Print" "$ENT" || true
+          /usr/libexec/PlistBuddy -c "Print :com.apple.security.application-groups" "$ENT" || true
+
+      # Обязательно пропишем App Group в NSE (и создадим .entitlements, если его не было)
+      - name: Ensure App Group entitlement (NSE)
+        script: |
+          cd "$IOS_DIR"
+          ENT_NSE=$(xcodebuild -project "$XCODE_PROJECT" -target "OneSignalNotificationServiceExtension" -showBuildSettings 2>/dev/null | awk -F'= ' '/CODE_SIGN_ENTITLEMENTS/ {print $2; exit}')
+          if [ -z "$ENT_NSE" ]; then
+            ruby -e "begin; require 'xcodeproj'; rescue LoadError; system('gem install xcodeproj --no-document') || exit(1); end"
+            ruby - <<'RUBY'
+            require 'xcodeproj'
+            proj = Xcodeproj::Project.open('Unity-iPhone.xcodeproj')
+            t = proj.targets.find { |x| x.name == 'OneSignalNotificationServiceExtension' }
+            raise 'NSE target not found' unless t
+            t.build_configurations.each do |cfg|
+              cfg.build_settings['CODE_SIGN_ENTITLEMENTS'] = 'OneSignalNotificationServiceExtension/OneSignalNotificationServiceExtension.entitlements'
+            end
+            proj.save
+            RUBY
+            ENT_NSE="OneSignalNotificationServiceExtension/OneSignalNotificationServiceExtension.entitlements"
+          fi
+          echo "NSE entitlements path: $ENT_NSE"
+          mkdir -p "$(dirname "$ENT_NSE")"
+          [ -f "$ENT_NSE" ] || touch "$ENT_NSE"
+          /usr/libexec/PlistBuddy -c "Add :com.apple.security.application-groups array" "$ENT_NSE" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Delete :com.apple.security.application-groups:0" "$ENT_NSE" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :com.apple.security.application-groups:0 string $APP_GROUP" "$ENT_NSE"
+          /usr/libexec/PlistBuddy -c "Print :com.apple.security.application-groups" "$ENT_NSE" || true
 
       - name: Apply provisioning profiles
         script: |
           cd "$IOS_DIR"
           xcode-project use-profiles
 
-      - name: Increment build number (by TestFlight)
-        script: |
-          LATEST=$(app-store-connect get-latest-testflight-build-number "$APP_STORE_APPLE_ID" || echo 0)
-          cd "$IOS_DIR"
-          agvtool new-version -all $((LATEST + 1))
-
-      # --- Fix for Xcode 15/16: disable traditional headermaps everywhere ---
+      # Fix для Xcode 15/16 — выключаем традиционные headermaps
       - name: Fix headermaps via xcodeproj (project + all targets)
         script: |
           cd "$IOS_DIR"
@@ -92,13 +114,31 @@ workflows:
           proj.save
           RUBY
 
-      - name: Verify headermap settings (App + NSE)
+      # Выберем ИМЕННО те App Store-профили, где есть нужная App Group
+      - name: Select matching App Store profiles (by App Group)
         script: |
           cd "$IOS_DIR"
-          echo ">>> App build settings:"
-          xcodebuild -project "$XCODE_PROJECT" -target "Unity-iPhone" -showBuildSettings | /usr/bin/grep -E 'ALWAYS_SEARCH_USER_PATHS|USE_HEADERMAP' || true
-          echo ">>> NSE build settings:"
-          xcodebuild -project "$XCODE_PROJECT" -target "OneSignalNotificationServiceExtension" -showBuildSettings | /usr/bin/grep -E 'ALWAYS_SEARCH_USER_PATHS|USE_HEADERMAP' || true
+          APP_PP_NAME=""; APP_PP_UUID=""
+          NSE_PP_NAME=""; NSE_PP_UUID=""
+          TEAM="$DEVELOPMENT_TEAM"
+          for p in "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision; do
+            [ -e "$p" ] || continue
+            PL=$(/usr/bin/security cms -D -i "$p")
+            AID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' /dev/stdin <<<"$PL" 2>/dev/null)
+            NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin <<<"$PL" 2>/dev/null)
+            UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' /dev/stdin <<<"$PL" 2>/dev/null)
+            GRP=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.security.application-groups' /dev/stdin <<<"$PL" 2>/dev/null || true)
+            if [[ "$AID" == "$TEAM.$BUNDLE_ID" ]] && [[ "$GRP" == *"$APP_GROUP"* ]]; then APP_PP_NAME="$NAME"; APP_PP_UUID="$UUID"; fi
+            if [[ "$AID" == "$TEAM.$NSE_BUNDLE_ID" ]] && [[ "$GRP" == *"$APP_GROUP"* ]]; then NSE_PP_NAME="$NAME"; NSE_PP_UUID="$UUID"; fi
+          done
+          echo "Selected profiles:"
+          echo "  App: $APP_PP_NAME ($APP_PP_UUID)"
+          echo "  NSE: $NSE_PP_NAME ($NSE_PP_UUID)"
+          [ -n "$APP_PP_UUID" ] && [ -n "$NSE_PP_UUID" ] || { echo "ERROR: Matching App Store profiles with App Group '$APP_GROUP' not found. Recreate profiles for both App IDs."; exit 1; }
+          echo "APP_PP_NAME=$APP_PP_NAME" >> $CM_ENV
+          echo "NSE_PP_NAME=$NSE_PP_NAME" >> $CM_ENV
+          echo "APP_PP_UUID=$APP_PP_UUID" >> $CM_ENV
+          echo "NSE_PP_UUID=$NSE_PP_UUID" >> $CM_ENV
 
       - name: Clean Xcode build
         script: |
@@ -109,8 +149,7 @@ workflows:
             xcodebuild -project "$XCODE_PROJECT" -scheme "$XCODE_SCHEME" -configuration Release clean
           fi
 
-      # ---------- РУЧНОЙ АРХИВ С ПОЛНЫМ ЛОГОМ ----------
-      - name: Archive (verbose)
+      - name: Archive (verbose, with explicit profiles)
         script: |
           set -o pipefail
           cd "$IOS_DIR"
@@ -121,31 +160,17 @@ workflows:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath "$ARCHIVE_PATH" \
-            archive | tee "$IOS_DIR/xcodebuild-archive.log"
+            archive \
+            DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
+            CODE_SIGN_STYLE=Manual \
+            "CODE_SIGN_IDENTITY=Apple Distribution" \
+            "PROVISIONING_PROFILE_SPECIFIER=$APP_PP_UUID" \
+            "OneSignalNotificationServiceExtension.PROVISIONING_PROFILE_SPECIFIER=$NSE_PP_UUID" \
+            | tee "$IOS_DIR/xcodebuild-archive.log"
 
-      # ---------- СБОРКА exportOptions.plist НА ОСНОВЕ УСТАНОВЛЕННЫХ ПРОФИЛЕЙ ----------
-      - name: Generate ExportOptions.plist (manual signing)
+      - name: Generate ExportOptions.plist
         script: |
           cd "$IOS_DIR"
-          APP_PP_NAME=""
-          NSE_PP_NAME=""
-          TEAM="$DEVELOPMENT_TEAM"
-
-          for p in "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision; do
-            [ -e "$p" ] || continue
-            PL=$(/usr/bin/security cms -D -i "$p")
-            BID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' /dev/stdin <<<"$PL" 2>/dev/null)
-            NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin <<<"$PL" 2>/dev/null)
-            [[ "$BID" == "$TEAM.$BUNDLE_ID" ]] && APP_PP_NAME="$NAME"
-            [[ "$BID" == "$TEAM.$NSE_BUNDLE_ID" ]] && NSE_PP_NAME="$NAME"
-          done
-
-          echo "Using provisioning profiles:"
-          echo "  App: $APP_PP_NAME"
-          echo "  NSE: $NSE_PP_NAME"
-
-          [ -n "$APP_PP_NAME" ] && [ -n "$NSE_PP_NAME" ] || { echo "ERROR: Could not find matching App Store profiles"; exit 1; }
-
           cat > ExportOptions.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -165,7 +190,6 @@ workflows:
           EOF
           /usr/libexec/PlistBuddy -c "Print" ExportOptions.plist || true
 
-      # ---------- ЭКСПОРТ IPA ----------
       - name: Export IPA
         script: |
           cd "$IOS_DIR"
