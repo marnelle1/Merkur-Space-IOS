@@ -109,19 +109,79 @@ workflows:
             xcodebuild -project "$XCODE_PROJECT" -scheme "$XCODE_SCHEME" -configuration Release clean
           fi
 
-      - name: Build ipa
+      # ---------- РУЧНОЙ АРХИВ С ПОЛНЫМ ЛОГОМ ----------
+      - name: Archive (verbose)
+        script: |
+          set -o pipefail
+          cd "$IOS_DIR"
+          ARCHIVE_PATH="$CM_BUILD_DIR/ios/xcarchive/Unity-iPhone.xcarchive"
+          mkdir -p "$(dirname "$ARCHIVE_PATH")"
+          xcodebuild -workspace "$XCODE_WORKSPACE" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            archive | tee "$IOS_DIR/xcodebuild-archive.log"
+
+      # ---------- СБОРКА exportOptions.plist НА ОСНОВЕ УСТАНОВЛЕННЫХ ПРОФИЛЕЙ ----------
+      - name: Generate ExportOptions.plist (manual signing)
         script: |
           cd "$IOS_DIR"
-          if [ -d "$XCODE_WORKSPACE" ]; then
-            xcode-project build-ipa --workspace "$XCODE_WORKSPACE" --scheme "$XCODE_SCHEME"
-          else
-            xcode-project build-ipa --project "$XCODE_PROJECT" --scheme "$XCODE_SCHEME"
-          fi
+          APP_PP_NAME=""
+          NSE_PP_NAME=""
+          TEAM="$DEVELOPMENT_TEAM"
+
+          for p in "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision; do
+            [ -e "$p" ] || continue
+            PL=$(/usr/bin/security cms -D -i "$p")
+            BID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' /dev/stdin <<<"$PL" 2>/dev/null)
+            NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin <<<"$PL" 2>/dev/null)
+            [[ "$BID" == "$TEAM.$BUNDLE_ID" ]] && APP_PP_NAME="$NAME"
+            [[ "$BID" == "$TEAM.$NSE_BUNDLE_ID" ]] && NSE_PP_NAME="$NAME"
+          done
+
+          echo "Using provisioning profiles:"
+          echo "  App: $APP_PP_NAME"
+          echo "  NSE: $NSE_PP_NAME"
+
+          [ -n "$APP_PP_NAME" ] && [ -n "$NSE_PP_NAME" ] || { echo "ERROR: Could not find matching App Store profiles"; exit 1; }
+
+          cat > ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store</string>
+            <key>teamID</key><string>$DEVELOPMENT_TEAM</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>$BUNDLE_ID</key><string>$APP_PP_NAME</string>
+              <key>$NSE_BUNDLE_ID</key><string>$NSE_PP_NAME</string>
+            </dict>
+            <key>compileBitcode</key><false/>
+          </dict>
+          </plist>
+          EOF
+          /usr/libexec/PlistBuddy -c "Print" ExportOptions.plist || true
+
+      # ---------- ЭКСПОРТ IPA ----------
+      - name: Export IPA
+        script: |
+          cd "$IOS_DIR"
+          ARCHIVE_PATH="$CM_BUILD_DIR/ios/xcarchive/Unity-iPhone.xcarchive"
+          EXPORT_PATH="$IOS_DIR/ipa_out"
+          mkdir -p "$EXPORT_PATH"
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportOptionsPlist ExportOptions.plist \
+            -exportPath "$EXPORT_PATH" | tee "$IOS_DIR/xcodebuild-export.log"
 
     artifacts:
-      - $IOS_DIR/*.ipa
-      - $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.dSYM
+      - $IOS_DIR/ipa_out/*.ipa
       - $IOS_DIR/xcodebuild-archive.log
+      - $IOS_DIR/xcodebuild-export.log
+      - $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.dSYM
 
     publishing:
       app_store_connect:
