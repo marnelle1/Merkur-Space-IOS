@@ -50,25 +50,29 @@ workflows:
             exit 1
           fi
 
-      # Добавляем App Group в главный таргет (подстраховка)
       - name: Ensure App Group entitlement (main app)
         script: |
           cd "$IOS_DIR"
           ENT="Unity-iPhone/Unity-iPhone.entitlements"
-          [ -f "$ENT" ] || touch "$ENT"
+          if [ ! -f "$ENT" ]; then
+            cat > "$ENT" <<'PLIST'
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0"><dict/></plist>
+            PLIST
+          fi
           /usr/libexec/PlistBuddy -c "Add :com.apple.security.application-groups array" "$ENT" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Delete :com.apple.security.application-groups:0" "$ENT" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :com.apple.security.application-groups:0 string $APP_GROUP" "$ENT"
           /usr/libexec/PlistBuddy -c "Print :com.apple.security.application-groups" "$ENT" || true
 
-      # Обязательно пропишем App Group в NSE (и создадим .entitlements, если его не было)
       - name: Ensure App Group entitlement (NSE)
         script: |
           cd "$IOS_DIR"
           ENT_NSE=$(xcodebuild -project "$XCODE_PROJECT" -target "OneSignalNotificationServiceExtension" -showBuildSettings 2>/dev/null | awk -F'= ' '/CODE_SIGN_ENTITLEMENTS/ {print $2; exit}')
           if [ -z "$ENT_NSE" ]; then
-            ruby -e "begin; require 'xcodeproj'; rescue LoadError; system('gem install xcodeproj --no-document') || exit(1); end"
-            ruby - <<'RUBY'
+            # установить CODE_SIGN_ENTITLEMENTS через xcodeproj, если пусто
+            cat > patch_nse.rb <<'RUBY'
             require 'xcodeproj'
             proj = Xcodeproj::Project.open('Unity-iPhone.xcodeproj')
             t = proj.targets.find { |x| x.name == 'OneSignalNotificationServiceExtension' }
@@ -78,11 +82,19 @@ workflows:
             end
             proj.save
             RUBY
+            ruby -e "begin; require 'xcodeproj'; rescue LoadError; system('gem install xcodeproj --no-document') || exit(1); end"
+            ruby patch_nse.rb
             ENT_NSE="OneSignalNotificationServiceExtension/OneSignalNotificationServiceExtension.entitlements"
           fi
           echo "NSE entitlements path: $ENT_NSE"
           mkdir -p "$(dirname "$ENT_NSE")"
-          [ -f "$ENT_NSE" ] || touch "$ENT_NSE"
+          if [ ! -f "$ENT_NSE" ]; then
+            cat > "$ENT_NSE" <<'PLIST'
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0"><dict/></plist>
+            PLIST
+          fi
           /usr/libexec/PlistBuddy -c "Add :com.apple.security.application-groups array" "$ENT_NSE" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Delete :com.apple.security.application-groups:0" "$ENT_NSE" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :com.apple.security.application-groups:0 string $APP_GROUP" "$ENT_NSE"
@@ -93,12 +105,11 @@ workflows:
           cd "$IOS_DIR"
           xcode-project use-profiles
 
-      # Fix для Xcode 15/16 — выключаем традиционные headermaps
       - name: Fix headermaps via xcodeproj (project + all targets)
         script: |
           cd "$IOS_DIR"
           ruby -e "begin; require 'xcodeproj'; rescue LoadError; system('gem install xcodeproj --no-document') || exit(1); end"
-          ruby - <<'RUBY'
+          cat > fix_headers.rb <<'RUBY'
           require 'xcodeproj'
           proj = Xcodeproj::Project.open('Unity-iPhone.xcodeproj')
           proj.build_configurations.each do |cfg|
@@ -113,8 +124,8 @@ workflows:
           end
           proj.save
           RUBY
+          ruby fix_headers.rb
 
-      # Выберем ИМЕННО те App Store-профили, где есть нужная App Group
       - name: Select matching App Store profiles (by App Group)
         script: |
           cd "$IOS_DIR"
