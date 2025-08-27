@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<plist version="1.0">
+  <dict>
+    <key>com.apple.security.application-groups</key>
+    <array>
+      <string>group.com.joams.merspace.onesignal</string>
+    </array>
+  </dict>
+</plist>
